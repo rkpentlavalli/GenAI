@@ -1,1 +1,15 @@
 api_key = "AIzaSyAWg41wUgDWUgLvSrr3i6gP8NlwEpGZo70"
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+import google.generativeai as genai
+import os
+import difflib
+ 
+
+# Configure the model
+model = genai.GenerativeModel("gemini-1.5-flash-latest")
+
+response = model.generate_content("Explain Delhi")
+generated_text = response.text
+print(generated_text)
