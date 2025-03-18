@@ -1,100 +1,479 @@
-"""Base agent for repository analysis."""
-from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
-
-from crewai import Agent, Task
-from langchain.tools import Tool, tool
-from langchain_openai import ChatOpenAI
-from pydantic import BaseModel
-
-from litellm import completion
-
-from langchain_google_genai import ChatGoogleGenerativeAI
-
-# Import the LLM class
-from crewai import Agent, LLM
-
+"""Agent for analyzing repository security and vulnerabilities."""
 import os
-# openai.api_key = os.getenv('OPENAI_API_KEY')
+import re
+from typing import Dict, List, Optional, Type
+import json
+import subprocess
+from pathlib import Path
+import tempfile
+import shutil
 
-import google.generativeai as genai
+from crewai import Agent, Crew, Task
+from crewai.tools import BaseTool
+from pydantic import BaseModel, Field
 
-class AnalysisResult(BaseModel):
-    """Structure for analysis results."""
-    category: str
-    findings: List[Dict]
-    recommendations: List[str]
+from .base_agent import AnalysisResult, BaseAnalysisAgent
 
+# Security check patterns
+SECURITY_PATTERNS = {
+    'hardcoded_secrets': [
+        r'password\s*=\s*[\"](.*?)[\"]',
+        r'secret\s*=\s*[\"](.*?)[\"]',
+        r'api[_-]?key\s*=\s*[\"](.*?)[\"]',
+        r'token\s*=\s*[\"](.*?)[\"]',
+        r'aws[_-]?access[_-]?key[_-]?id\s*=\s*[\"](.*?)[\"]',
+        r'aws[_-]?secret[_-]?access[_-]?key\s*=\s*[\"](.*?)[\"]'
+    ],
+    'sql_injection': [
+        r'execute\s*\(.*\%.*\)',
+        r'cursor\.execute\s*\(.*\+.*\)',
+        r'mysql\.connector\.connect\s*\(.*\+.*\)'
+    ],
+    'file_operations': [
+        r'os\.system\s*\(.*\)',
+        r'subprocess\.call\s*\(.*shell\s*=\s*True.*\)',
+        r'eval\s*\(.*\)',
+        r'exec\s*\(.*\)'
+    ]
+}
 
-class BaseAnalysisAgent(ABC):
-    """Base class for repository analysis agents."""
-    # os.getenv('OPENAI_API_KEY') #
+SENSITIVE_FILES = [
+    '.env', '.env.local', '.env.development', '.env.production',
+    'config.json', 'secrets.json', 'credentials.json',
+    'id_rsa', 'id_dsa', '.ssh/id_rsa', '.ssh/id_dsa',
+    '.git/config', '.gitconfig',
+    '*.key', '*.pem', '*.crt', '*.cer', '*.p12', '*.pfx'
+]
+
+class ScanInput(BaseModel):
+    """Input schema for vulnerability scan"""
+    repo_path: str = Field(..., description="Path to repository to scan")
+
+class SecurityScanTool(BaseTool):
+    """Tool for scanning repository vulnerabilities"""
+    name: str = "scan_for_vulnerabilities"
+    description: str = "Scans repository for known vulnerabilities using safety check"
+    args_schema: Type[BaseModel] = ScanInput
+    repo_path: str = ""
+
+    def __init__(self, repo_path: str):
+        super().__init__()
+        self.repo_path = repo_path
+
+    def _run(self, repo_path: str) -> Dict:
+        """Run the comprehensive security scan"""
+        results = {
+            'dependency_vulnerabilities': self._scan_dependencies(repo_path),
+            'static_analysis': self._run_bandit(repo_path),
+            'sensitive_files': self._scan_sensitive_files(repo_path),
+            'file_permissions': self._scan_file_permissions(repo_path)
+        }
+        
+        return results
+    
+    def _scan_dependencies(self, repo_path: str) -> Dict:
+        """Scan dependencies for known vulnerabilities"""
+        try:
+            # Run pip freeze to get dependencies
+            result = subprocess.run(
+                ['pip', 'freeze'],
+                cwd=repo_path,
+                capture_output=True,
+                text=True
+            )
+            requirements = result.stdout.strip()
+            
+            # Write requirements to a temp file
+            temp_req_file = os.path.join(repo_path, 'temp_requirements.txt')
+            with open(temp_req_file, 'w') as f:
+                f.write(requirements)
+            
+            # Run safety check
+            result = subprocess.run(
+                ['safety', 'check', '-r', 'temp_requirements.txt', '--json'],
+                cwd=repo_path,
+                capture_output=True,
+                text=True
+            )
+            
+            # Clean up temp file
+            os.remove(temp_req_file)
+            
+            # Parse safety output
+            vulnerabilities = []
+            if result.stdout:
+                try:
+                    safety_results = json.loads(result.stdout)
+                    for vuln in safety_results:
+                        vulnerabilities.append({
+                            'package': vuln[0],
+                            'installed_version': vuln[1],
+                            'vulnerable_version': vuln[2],
+                            'vulnerability_id': vuln[3],
+                            'description': vuln[4]
+                        })
+                except json.JSONDecodeError:
+                    pass
+            
+            return {
+                'vulnerabilities': vulnerabilities,
+                'total_count': len(vulnerabilities)
+            }
+        except Exception as e:
+            return {
+                'error': str(e),
+                'vulnerabilities': [],
+                'total_count': 0
+            }
+    
+    def _run_bandit(self, repo_path: str) -> Dict:
+        """Run bandit static code analysis"""
+        try:
+            # Create a temporary file for JSON output
+            with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as tmp_file:
+                output_file = tmp_file.name
+                # Check if bandit is available
+                bandit_path = shutil.which('bandit')
+                print(bandit_path)
+                # if not bandit_path:
+                # raise FileNotFoundError("Bandit executable not found. Please ensure it is installed and available in your PATH.")
+                # # Run bandit with JSON output
+                result = subprocess.run(
+                    [
+                        bandit_path,
+                        '-r',  # Recursive  # JSON output format
+                        '-f', 'json',  # JSON output format
+                        '-o', output_file,  # Output file
+                        repo_path  # Target directory
+                    ],
+                    capture_output=True,
+                    text=True
+                )               
+                # result = subprocess.run(
+                #     [
+                #         'C:\\Users\\ramakrishna.p22\\OneDrive - Infosys Limited\\2025\\CodeScan\\myEnv\\Scripts\\bandit.exe',
+                #         '-r',  # Recursive
+                #         '-f', 'json',  # JSON output format
+                #         '-o', output_file,  # Output file
+                #         repo_path  # Target directory
+                #     ],
+                #     capture_output=True,
+                #     text=True
+                # )
+            # Read the results
+            with open(output_file, 'r') as f:
+                bandit_results = json.load(f)
+
+            # Clean up temp file
+            os.unlink(output_file)
+
+            # Process results
+            issues = []
+            for result in bandit_results.get('results', []):
+                issues.append({
+                    'type': result.get('test_id', ''),
+                    'test_name': result.get('test_name', ''),
+                    'issue_severity': result.get('issue_severity', ''),
+                    'issue_confidence': result.get('issue_confidence', ''),
+                    'file': result.get('filename', ''),
+                    'line': result.get('line_number', 0),
+                    'snippet': result.get('code', ''),
+                    'description': result.get('issue_text', ''),
+                    'more_info': result.get('more_info', '')
+                })
+
+            # Group issues by severity
+            severity_counts = {
+                'HIGH': len([i for i in issues if i['issue_severity'] == 'HIGH']),
+                'MEDIUM': len([i for i in issues if i['issue_severity'] == 'MEDIUM']),
+                'LOW': len([i for i in issues if i['issue_severity'] == 'LOW'])
+            }
+
+            return {
+                'issues': issues,
+                'total_count': len(issues),
+                'severity_counts': severity_counts,
+                'metrics': bandit_results.get('metrics', {})
+            }
+
+        except Exception as e:
+            return {
+                'error': str(e),
+                'issues': [],
+                'total_count': 0,
+                'severity_counts': {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0},
+                'metrics': {}
+            }
+    
+    def _scan_sensitive_files(self, repo_path: str) -> Dict:
+        """Scan for sensitive files"""
+        sensitive_files = []
+        
+        for pattern in SENSITIVE_FILES:
+            for file_path in Path(repo_path).rglob(pattern):
+                if '.git' in str(file_path) or 'venv' in str(file_path) or 'env' in str(file_path):
+                    continue
+                    
+                sensitive_files.append({
+                    'file': os.path.relpath(file_path, repo_path),
+                    'type': pattern,
+                    'risk': 'HIGH'
+                })
+        
+        return {
+            'files': sensitive_files,
+            'total_count': len(sensitive_files)
+        }
+    
+    def _scan_file_permissions(self, repo_path: str) -> Dict:
+        """Scan for file permission issues"""
+        permission_issues = []
+        
+        # Only check permissions on Unix-like systems
+        if os.name != 'nt':
+            for root, _, files in os.walk(repo_path):
+                if '.git' in root or 'venv' in root or 'env' in root:
+                    continue
+                    
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    try:
+                        mode = os.stat(file_path).st_mode
+                        # Check for world-writable files
+                        if mode & 0o002:
+                            permission_issues.append({
+                                'file': os.path.relpath(file_path, repo_path),
+                                'issue': 'World-writable',
+                                'mode': oct(mode & 0o777),
+                                'risk': 'HIGH'
+                            })
+                        # Check for world-readable sensitive files
+                        elif mode & 0o004 and any(pattern.replace('*', '') in file for pattern in SENSITIVE_FILES):
+                            permission_issues.append({
+                                'file': os.path.relpath(file_path, repo_path),
+                                'issue': 'World-readable sensitive file',
+                                'mode': oct(mode & 0o777),
+                                'risk': 'MEDIUM'
+                            })
+                    except Exception as e:
+                        permission_issues.append({
+                            'file': os.path.relpath(file_path, repo_path),
+                            'error': str(e)
+                        })
+        
+        return {
+            'issues': permission_issues,
+            'total_count': len(permission_issues)
+        }
+
+class SecurityAnalysisAgent(BaseAnalysisAgent):
+    """Agent for analyzing repository security and vulnerabilities."""
+    
     def __init__(self, repo_path: str, gemini_api_key: Optional[str] = None):
         """Initialize the agent with repository path and optional API key."""
-        self.repo_path = repo_path
-        # self.openai_api_key = ""
-        self.gemini_api_key = "AIzaSyAWg41wUgDWUgLvSrr3i6gP8NlwEpGZo70"
-        self.llm = self._initialize_llm()
+        super().__init__(repo_path, gemini_api_key)
+        print(gemini_api_key)
+        self.scan_tool = SecurityScanTool(repo_path)
     
-    # def _initialize_llm(self) -> ChatOpenAI:
-    #     """Initialize the language model."""
-    #     return ChatOpenAI(
-    #         model="gpt-4",
-    #         temperature=0,
-    #         api_key=self.openai_api_key
-    #     )
-    
-    def _initialize_llm(self) -> ChatGoogleGenerativeAI:
-        """Initialize the Gemini language model."""
-        print(os.getenv("gemini_api_key"))
-        print(self.gemini_api_key)
-        return LLM(model="gemini/gemini-1.5-flash-latest",temperature=0.5, api_key=self.gemini_api_key)
-        # return ChatGoogleGenerativeAI(
-        #     model="gemini-1.5-flash-latest",  # Adjust this to the appropriate model name if different
-        #     temperature=0.5,
-        #     verbose=True,
-        #     api_key=self.gemini_api_key  # Assuming you use a similar API key as GoogleGenerativeAI
-        # )       
-    
-    @abstractmethod
     def analyze(self) -> AnalysisResult:
-        """Perform the analysis. To be implemented by specific agents."""
-        pass
-    
-    def create_agent(self, role: str, goal: str, backstory: str) -> Agent:
-        """Create a CrewAI agent with specific role and goal."""
-        return Agent(
-            role=role,
-            goal=goal,
-            backstory=backstory,
+        """Analyze repository security."""
+        # Create security analysis agent
+        security_agent = Agent(
+            role='Security Analyst',
+            goal='Analyze repository for security vulnerabilities and provide recommendations',
+            backstory="""You are an expert in software security and vulnerability assessment.
+            Your task is to analyze codebases for security issues and provide actionable recommendations.
+            You have expertise in Python security best practices and common vulnerability patterns.""",
+            verbose=True,
+            allow_delegation=False,
             llm=self.llm,
+            tools=[self.scan_tool]
+        )
+        
+        # Scan for vulnerabilities
+        scan_results = self.scan_tool._run(self.repo_path)
+        
+        # Process findings
+        findings = []
+        
+        # Add vulnerability scan findings
+        dependency_vulns = scan_results['dependency_vulnerabilities']
+        findings.append({
+            'component': 'Vulnerability Scan',
+            'details': {
+                'vulnerabilities': dependency_vulns.get('vulnerabilities', []),
+                'total_count': dependency_vulns.get('total_count', 0),
+                'error': dependency_vulns.get('error', None)
+            }
+        })
+        
+        # Add static analysis findings
+        static_analysis = scan_results['static_analysis']
+        findings.append({
+            'component': 'Code Analysis',
+            'details': {
+                'issues': [{
+                    'file': issue['file'],
+                    'line': issue['line'],
+                    'severity': issue['issue_severity'],
+                    'confidence': issue['issue_confidence'],
+                    'description': issue['description'],
+                    'snippet': issue['snippet'],
+                    'type': issue['test_name'],
+                    'more_info': issue['more_info']
+                } for issue in static_analysis.get('issues', [])],
+                'total_count': static_analysis.get('total_count', 0),
+                'severity_counts': static_analysis.get('severity_counts', {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0})
+            }
+        })
+        
+        # Add sensitive file findings
+        sensitive_files = scan_results['sensitive_files']
+        findings.append({
+            'component': 'Sensitive Files',
+            'details': {
+                'files': sensitive_files.get('files', []),
+                'total_count': sensitive_files.get('total_count', 0)
+            }
+        })
+        
+        # Add file permission findings
+        permissions = scan_results['file_permissions']
+        findings.append({
+            'component': 'File Permissions',
+            'details': {
+                'issues': permissions.get('issues', []),
+                'total_count': permissions.get('total_count', 0)
+            }
+        })
+        
+        # Create analysis task
+        analysis_task = self.create_task(
+            f"""Analyze the following security scan results and provide recommendations:
+            
+            Scan Results: {json.dumps(scan_results, indent=2)}
+            
+            For each security finding:
+            1. Assess the risk level and potential impact
+            2. Explain why it's a security concern
+            3. Provide specific code-level fixes
+            4. Suggest preventive measures
+            
+            Group your analysis by:
+            1. Critical Issues (High severity)
+            2. Important Issues (Medium severity)
+            3. Minor Issues (Low severity)
+            4. Dependency Vulnerabilities
+            5. File Security Issues
+            
+            For each issue category:
+            - Summarize the key findings
+            - Provide actionable recommendations
+            - Include code examples for fixes where applicable
+            
+            Format your response as a structured security report with clear sections.
+            Use markdown for better readability.
+            """,
+            security_agent,
+            expected_output="""A comprehensive security analysis report containing:
+            1. Executive Summary
+            2. Critical Security Issues
+            3. Important Security Issues
+            4. Minor Security Issues
+            5. Dependency Analysis
+            6. File Security Analysis
+            7. Recommendations and Best Practices
+            
+            Each section should include:
+            - Clear description of issues
+            - Risk assessment
+            - Code examples for fixes
+            - Best practices and preventive measures
+            
+            The report should be well-formatted markdown with clear sections and actionable items."""
+        )
+        
+        # Execute task and get result
+        crew = Crew(
+            agents=[security_agent],
+            tasks=[analysis_task],
             verbose=True
         )
-    
-    def create_task(self, description: str, agent: Agent, expected_output: str = None) -> Task:
-        """Create a task for an agent."""
-        # Get all tools from the instance
-        tools = []
-        for attr_name in dir(self):
-            attr = getattr(self, attr_name)
-            if hasattr(attr, '_tool'):
-                # Create a wrapper that handles the tool_input
-                def tool_wrapper(tool_input: Dict = None, _func=attr, _self=self):
-                    return _func(_self, tool_input)
-                
-                tools.append(
-                    Tool(
-                        name=getattr(attr, '_tool', {}).get('name', attr_name),
-                        description=attr.__doc__ or '',
-                        func=tool_wrapper
-                    )
-                )
+        result = crew.kickoff()
         
-        # Add tools to agent
-        agent.tools = tools
+        # Extract recommendations based on findings
+        recommendations = []
         
-        return Task(
-            description=description,
-            agent=agent,
-            expected_output=expected_output or "A detailed analysis with findings and recommendations."
+        # Dependency recommendations
+        if dependency_vulns.get('total_count', 0) > 0:
+            recommendations.append("Update vulnerable dependencies to their latest secure versions")
+            recommendations.append("Regularly run dependency security checks")
+        
+        # Code analysis recommendations
+        if static_analysis.get('total_count', 0) > 0:
+            if static_analysis.get('severity_counts', {}).get('HIGH', 0) > 0:
+                recommendations.append("Fix high-severity code vulnerabilities immediately")
+            if any(i for i in static_analysis.get('issues', []) if 'request_without_timeout' in i.get('type', '')):
+                recommendations.append("Add timeouts to all HTTP requests to prevent hanging")
+            if any(i for i in static_analysis.get('issues', []) if 'sql' in i.get('type', '').lower()):
+                recommendations.append("Use parameterized queries to prevent SQL injection")
+        
+        # Sensitive file recommendations
+        if sensitive_files.get('total_count', 0) > 0:
+            recommendations.append("Move sensitive data to environment variables")
+            recommendations.append("Add sensitive files to .gitignore")
+        
+        # File permission recommendations
+        if permissions.get('total_count', 0) > 0:
+            recommendations.append("Fix insecure file permissions")
+            recommendations.append("Implement proper file access controls")
+        
+        # Always add general recommendations
+        recommendations.extend([
+            "Implement security scanning in CI/CD pipeline",
+            "Regular security audits and updates",
+            "Follow security best practices in code reviews"
+        ])
+        
+        # Add LLM analysis result as a separate component
+        findings.append({
+            'component': 'Security Analysis',
+            'details': result
+        })
+        
+        return AnalysisResult(
+            category="Security Analysis",
+            findings=findings,
+            recommendations=recommendations
+        )
+        
+        # Execute analysis
+        analysis_result = crew.kickoff()
+        
+        # Parse recommendations from analysis result
+        recommendations = []
+        if isinstance(analysis_result, str):
+            sections = analysis_result.split('\n')
+            in_recommendations = False
+            for line in sections:
+                if 'recommendation' in line.lower():
+                    in_recommendations = True
+                    continue
+                if in_recommendations and line.strip().startswith('-'):
+                    recommendations.append(line.strip()[2:].strip())
+                elif in_recommendations and line.strip() and not line.startswith(' '):
+                    in_recommendations = False
+        
+        # Return structured results
+        return AnalysisResult(
+            category="Security Analysis",
+            findings=[
+                {"component": "Vulnerability Scan", "details": vuln_scan},
+                {"component": "Security Analysis", "details": analysis_result}
+            ],
+            recommendations=recommendations if recommendations else [
+                "Update dependencies to their latest secure versions",
+                "Implement security scanning in CI/CD pipeline",
+                "Regular security audits recommended"
+            ]
         )
