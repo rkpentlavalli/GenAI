@@ -1,15 +1,100 @@
-api_key = "AIzaSyAWg41wUgDWUgLvSrr3i6gP8NlwEpGZo70"
+"""Base agent for repository analysis."""
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional
+
+from crewai import Agent, Task
+from langchain.tools import Tool, tool
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel
+
+from litellm import completion
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-import google.generativeai as genai
+# Import the LLM class
+from crewai import Agent, LLM
+
 import os
-import difflib
- 
+# openai.api_key = os.getenv('OPENAI_API_KEY')
 
-# Configure the model
-model = genai.GenerativeModel("gemini-1.5-flash-latest")
+import google.generativeai as genai
 
-response = model.generate_content("Explain Delhi")
-generated_text = response.text
-print(generated_text)
+class AnalysisResult(BaseModel):
+    """Structure for analysis results."""
+    category: str
+    findings: List[Dict]
+    recommendations: List[str]
+
+
+class BaseAnalysisAgent(ABC):
+    """Base class for repository analysis agents."""
+    # os.getenv('OPENAI_API_KEY') #
+    def __init__(self, repo_path: str, gemini_api_key: Optional[str] = None):
+        """Initialize the agent with repository path and optional API key."""
+        self.repo_path = repo_path
+        # self.openai_api_key = ""
+        self.gemini_api_key = "AIzaSyAWg41wUgDWUgLvSrr3i6gP8NlwEpGZo70"
+        self.llm = self._initialize_llm()
+    
+    # def _initialize_llm(self) -> ChatOpenAI:
+    #     """Initialize the language model."""
+    #     return ChatOpenAI(
+    #         model="gpt-4",
+    #         temperature=0,
+    #         api_key=self.openai_api_key
+    #     )
+    
+    def _initialize_llm(self) -> ChatGoogleGenerativeAI:
+        """Initialize the Gemini language model."""
+        print(os.getenv("gemini_api_key"))
+        print(self.gemini_api_key)
+        return LLM(model="gemini/gemini-1.5-flash-latest",temperature=0.5, api_key=self.gemini_api_key)
+        # return ChatGoogleGenerativeAI(
+        #     model="gemini-1.5-flash-latest",  # Adjust this to the appropriate model name if different
+        #     temperature=0.5,
+        #     verbose=True,
+        #     api_key=self.gemini_api_key  # Assuming you use a similar API key as GoogleGenerativeAI
+        # )       
+    
+    @abstractmethod
+    def analyze(self) -> AnalysisResult:
+        """Perform the analysis. To be implemented by specific agents."""
+        pass
+    
+    def create_agent(self, role: str, goal: str, backstory: str) -> Agent:
+        """Create a CrewAI agent with specific role and goal."""
+        return Agent(
+            role=role,
+            goal=goal,
+            backstory=backstory,
+            llm=self.llm,
+            verbose=True
+        )
+    
+    def create_task(self, description: str, agent: Agent, expected_output: str = None) -> Task:
+        """Create a task for an agent."""
+        # Get all tools from the instance
+        tools = []
+        for attr_name in dir(self):
+            attr = getattr(self, attr_name)
+            if hasattr(attr, '_tool'):
+                # Create a wrapper that handles the tool_input
+                def tool_wrapper(tool_input: Dict = None, _func=attr, _self=self):
+                    return _func(_self, tool_input)
+                
+                tools.append(
+                    Tool(
+                        name=getattr(attr, '_tool', {}).get('name', attr_name),
+                        description=attr.__doc__ or '',
+                        func=tool_wrapper
+                    )
+                )
+        
+        # Add tools to agent
+        agent.tools = tools
+        
+        return Task(
+            description=description,
+            agent=agent,
+            expected_output=expected_output or "A detailed analysis with findings and recommendations."
+        )
